@@ -1,11 +1,65 @@
-# ใช้แทน Dockerfile เดิมเมื่อ AnyaWave บิลด์ผ่านแล้ว (เปลี่ยนชื่อเป็น Dockerfile)
-# ใช้อิมเมจทางการเป็นฐาน (มี Java, ไลบรารีเนทีฟ และ glibc ที่ DAVE ต้องการ) แล้วเอา jar ของเราทับ
-FROM ghcr.io/lavalink-devs/lavalink:4.2.2
-# แก้ YOUR_GITHUB_NAME เป็นชื่อ GitHub ของคุณ (repo ต้องเป็น public ถึงจะโหลดได้)
-ADD --chown=lavalink:lavalink https://github.com/catlookkas24-beluga/AnyaWave/releases/download/latest/Lavalink.jar /opt/Lavalink/Lavalink.jar
-COPY --chown=lavalink:lavalink application.yml /opt/Lavalink/application.yml
-COPY --chown=lavalink:lavalink start.sh /opt/Lavalink/start.sh
-RUN chmod +x /opt/Lavalink/start.sh
-ENV JAVA_TOOL_OPTIONS="-Xmx350m -XX:+UseSerialGC"
-ENTRYPOINT ["/opt/Lavalink/start.sh"]
-CMD []
+name: AnyaWave build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LAVALINK_IMAGE: ghcr.io/lavalink-devs/lavalink:4.2.2
+  LAVAPLAYER_REPO: sidey383/lavaplayer
+  LAVAPLAYER_SHA: 43da496dcd45489e0479802847207442f715e454
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAVAPLAYER_REPO }}
+          ref: ${{ env.LAVAPLAYER_SHA }}
+          path: lavaplayer-src
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build patched Lavaplayer
+        working-directory: lavaplayer-src
+        run: |
+          chmod +x gradlew
+          ./gradlew :main:jar -x test --no-daemon
+
+      - name: Patch Lavalink.jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          JAR=$(ls lavaplayer-src/main/build/libs/*.jar | grep -v -e sources -e javadoc | head -n 1)
+          echo "patched lavaplayer = $JAR"
+          docker pull "$LAVALINK_IMAGE"
+          docker create --name lv "$LAVALINK_IMAGE"
+          docker cp lv:/opt/Lavalink/Lavalink.jar Lavalink.orig.jar
+          docker rm lv
+          ENTRY=$(unzip -Z1 Lavalink.orig.jar | grep -E '^BOOT-INF/lib/lavaplayer-[0-9][^/]*\.jar$' | head -n 1)
+          test -n "$ENTRY" || { echo "lavaplayer not found in Lavalink.jar"; exit 1; }
+          echo "replace entry = $ENTRY"
+          mkdir -p "patch/$(dirname "$ENTRY")"
+          cp "$JAR" "patch/$ENTRY"
+          cp Lavalink.orig.jar Lavalink.jar
+          (cd patch && zip -0 ../Lavalink.jar "$ENTRY")
+          unzip -p Lavalink.jar "$ENTRY" > check.jar
+          unzip -Z1 check.jar | grep -q 'SoundCloudAacSegmentDecoder' || { echo "AAC class missing"; exit 1; }
+          unzip -tq Lavalink.jar
+
+      - name: Publish release latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create latest --repo "$GITHUB_REPOSITORY" --title "AnyaWave latest" --notes "Lavalink 4.2.2 with patched lavaplayer" --prerelease
+          gh release upload latest Lavalink.jar --repo "$GITHUB_REPOSITORY" --clobber
